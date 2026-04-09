@@ -14,9 +14,10 @@ from datetime import date, datetime
 from html import unescape
 from pathlib import Path
 from typing import Any, Literal, Sequence
-from urllib.parse import urlencode, urljoin, urlparse
 from urllib.error import HTTPError, URLError
+from urllib.parse import urlencode, urljoin, urlparse
 from urllib.request import HTTPSHandler, ProxyHandler, Request, build_opener
+from zoneinfo import ZoneInfo
 
 from playwright.sync_api import (
     BrowserContext,
@@ -38,10 +39,12 @@ DEFAULT_MAX_WORKERS = 8
 DEFAULT_REQUEST_TIMEOUT_SECONDS = 30
 DEFAULT_REQUEST_RETRIES = 3
 DEFAULT_REQUEST_RETRY_BACKOFF_SECONDS = 1.0
-DEFAULT_TIMEZONE = datetime.now().astimezone().tzinfo
+DEFAULT_TIMEZONE = ZoneInfo("America/Chicago")
 DEFAULT_LOGIN_TIMEOUT_MILLISECONDS = 30_000
 DEFAULT_LOGIN_TOTAL_TIMEOUT_SECONDS = 75
 DEFAULT_LOGIN_MAX_STEPS = 12
+LUNCH_WINDOW_START_MINUTES = 11 * 60
+LUNCH_WINDOW_END_MINUTES = 15 * 60
 SHORT_DATE_PATTERN = re.compile(
     r"(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun), [A-Z][a-z]{2} \d{1,2}, \d{4}"
 )
@@ -197,6 +200,7 @@ class EventDetail(BaseModel):
     food_provided: bool
     location_name: str | None = None
     address: str | None = None
+    start_datetime: datetime | None = None
 
 
 class FoodEvent(BaseModel):
@@ -852,14 +856,51 @@ def extract_meta_description(html_text: str) -> str | None:
     return normalize_whitespace(unescape(match.group(1)))
 
 
+def parse_event_start_datetime(value: str | None) -> datetime | None:
+    if value is None:
+        return None
+
+    normalized = value.strip()
+    if not normalized:
+        return None
+
+    try:
+        parsed = datetime.fromisoformat(normalized.replace("Z", "+00:00"))
+    except ValueError:
+        LOGGER.warning(
+            "Failed to parse event start datetime",
+            extra={"raw_start_datetime": value},
+        )
+        return None
+
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=DEFAULT_TIMEZONE)
+
+    return parsed.astimezone(DEFAULT_TIMEZONE)
+
+
+def is_lunch_start_datetime(start_datetime: datetime | None, target_date: date) -> bool:
+    if start_datetime is None:
+        return False
+
+    local_start = start_datetime.astimezone(DEFAULT_TIMEZONE)
+    if local_start.date() != target_date:
+        return False
+
+    start_minutes = (local_start.hour * 60) + local_start.minute
+    return LUNCH_WINDOW_START_MINUTES <= start_minutes < LUNCH_WINDOW_END_MINUTES
+
+
 def parse_event_detail_html(html_text: str) -> EventDetail:
     json_ld = extract_json_ld_event(html_text)
     description = None
     location_name = None
     address = None
+    start_datetime = None
 
     if json_ld is not None:
         description = normalize_whitespace(json_ld.description or "") or None
+        start_datetime = parse_event_start_datetime(json_ld.start_date)
         if json_ld.location is not None:
             location_name = clean_room_text(
                 html_fragment_to_text(json_ld.location.name)
@@ -878,6 +919,7 @@ def parse_event_detail_html(html_text: str) -> EventDetail:
         food_provided=food_provided,
         location_name=location_name,
         address=address,
+        start_datetime=start_datetime,
     )
 
 
@@ -899,17 +941,41 @@ def fetch_event_detail(event_url: str, config: RuntimeConfig) -> EventDetail:
             "food_provided": detail.food_provided,
             "has_location_name": detail.location_name is not None,
             "private_location": is_private_location(detail.location_name),
+            "start_datetime": (
+                detail.start_datetime.isoformat()
+                if detail.start_datetime is not None
+                else None
+            ),
         },
     )
     return detail
 
 
-def build_food_event(event: PublicEvent, config: RuntimeConfig) -> FoodEvent | None:
+def build_food_event(
+    event: PublicEvent, config: RuntimeConfig, target_date: date
+) -> FoodEvent | None:
     detail = fetch_event_detail(event.event_url, config)
     if not detail.food_provided:
         LOGGER.info(
             "Skipping event without food",
             extra={"event_id": event.event_id, "event_title": event.title},
+        )
+        return None
+
+    if not is_lunch_start_datetime(detail.start_datetime, target_date):
+        LOGGER.info(
+            "Skipping event outside lunch window",
+            extra={
+                "event_id": event.event_id,
+                "event_title": event.title,
+                "start_datetime": (
+                    detail.start_datetime.isoformat()
+                    if detail.start_datetime is not None
+                    else None
+                ),
+                "lunch_window_start": "11:00",
+                "lunch_window_end": "15:00",
+            },
         )
         return None
 
@@ -967,13 +1033,16 @@ def collect_food_events(
             extra={
                 "worker_count": worker_count,
                 "matching_event_count": len(matching_events),
+                "lunch_window_start": "11:00",
+                "lunch_window_end": "15:00",
             },
         )
         with ThreadPoolExecutor(max_workers=worker_count) as executor:
             food_events = [
                 food_event
                 for food_event in executor.map(
-                    lambda event: build_food_event(event, config), matching_events
+                    lambda event: build_food_event(event, config, target_date),
+                    matching_events,
                 )
                 if food_event is not None
             ]
@@ -1160,7 +1229,7 @@ def build_slack_text(result: DigestResult | None, session_valid: bool) -> str:
         target = (
             result.target_date.isoformat() if result is not None else "unknown date"
         )
-        sections = [f"No food events found for {target}."]
+        sections = [f"No lunch food events found for {target}."]
         if not session_valid:
             sections.append(SESSION_WARNING_TEXT)
         return "\n\n".join(sections)
@@ -1186,7 +1255,7 @@ def build_slack_text(result: DigestResult | None, session_valid: bool) -> str:
     if not session_valid:
         sections.append(SESSION_WARNING_TEXT)
 
-    header = f"*Food Events for {format_target_date(result.target_date)}*"
+    header = f"*Lunch Food Events for {format_target_date(result.target_date)}*"
     return "\n\n".join([header, *sections])
 
 
@@ -1222,7 +1291,7 @@ def build_slack_payload(
             SlackRichTextSection(
                 elements=[
                     slack_text_element(
-                        f"Food Events for {format_target_date(result.target_date)}",
+                        f"Lunch Food Events for {format_target_date(result.target_date)}",
                         bold=True,
                     )
                 ]
@@ -1237,7 +1306,7 @@ def build_slack_payload(
             SlackRichTextBlock(
                 elements=[
                     SlackRichTextSection(
-                        elements=[slack_text_element("No Events", bold=True)]
+                        elements=[slack_text_element("No Lunch Events", bold=True)]
                     )
                 ]
             ),
@@ -1280,7 +1349,7 @@ def build_slack_payload(
 
 def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Find CampusGroups food events and optionally post them to Slack."
+        description="Find CampusGroups lunch food events and optionally post them to Slack."
     )
     parser.add_argument(
         "--date",

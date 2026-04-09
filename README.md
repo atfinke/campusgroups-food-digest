@@ -1,6 +1,6 @@
 # CampusGroups Food Digest
 
-Small Python CLI that reads authenticated Kellogg CampusGroups events, keeps the ones with `Food Provided`, and prints or posts a Slack digest.
+Small Python CLI that reads authenticated Kellogg CampusGroups events, keeps the lunch ones with `Food Provided`, and prints or posts a Slack digest.
 
 Built entirely by OpenAI GPT-5.4 via Codex.
 
