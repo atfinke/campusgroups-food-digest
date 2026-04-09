@@ -1,0 +1,65 @@
+name: Daily Food Digest
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "25 6 * * *"
+      timezone: "America/Chicago"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: daily-food-digest
+  cancel-in-progress: false
+
+jobs:
+  send-digest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      NORTHWESTERN_NETID: ${{ secrets.NORTHWESTERN_NETID }}
+      NORTHWESTERN_PASSWORD: ${{ secrets.NORTHWESTERN_PASSWORD }}
+      SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+      PYTHONUNBUFFERED: "1"
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install runtime dependency
+        run: python -m pip install --disable-pip-version-check -r requirements.txt
+
+      - name: Install Playwright browser
+        run: python -m playwright install --with-deps chromium
+
+      - name: Validate required secrets
+        run: |
+          if [ -z "${NORTHWESTERN_NETID}" ]; then
+            echo "Missing NORTHWESTERN_NETID secret." >&2
+            exit 1
+          fi
+
+          if [ -z "${NORTHWESTERN_PASSWORD}" ]; then
+            echo "Missing NORTHWESTERN_PASSWORD secret." >&2
+            exit 1
+          fi
+
+          if [ -z "${SLACK_WEBHOOK_URL}" ]; then
+            echo "Missing SLACK_WEBHOOK_URL secret." >&2
+            exit 1
+          fi
+
+      - name: Send daily Slack digest
+        run: |
+          target_date="$(TZ=America/Chicago date +%F)"
+          set +e
+          python campusgroups_food_digest.py --date "${target_date}" --send-slack
+          status=$?
+          if [ "${status}" -ne 0 ] && [ "${status}" -ne 2 ]; then
+            exit "${status}"
+          fi
