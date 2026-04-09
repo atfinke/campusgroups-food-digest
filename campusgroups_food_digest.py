@@ -1229,7 +1229,7 @@ def build_slack_text(result: DigestResult | None, session_valid: bool) -> str:
         target = (
             result.target_date.isoformat() if result is not None else "unknown date"
         )
-        sections = [f"No lunch food events found for {target}."]
+        sections = [f"No lunch events with food found for {target}."]
         if not session_valid:
             sections.append(SESSION_WARNING_TEXT)
         return "\n\n".join(sections)
@@ -1255,7 +1255,7 @@ def build_slack_text(result: DigestResult | None, session_valid: bool) -> str:
     if not session_valid:
         sections.append(SESSION_WARNING_TEXT)
 
-    header = f"*Lunch Food Events for {format_target_date(result.target_date)}*"
+    header = f"*Lunch Events with Food for {format_target_date(result.target_date)}*"
     return "\n\n".join([header, *sections])
 
 
@@ -1291,7 +1291,7 @@ def build_slack_payload(
             SlackRichTextSection(
                 elements=[
                     slack_text_element(
-                        f"Lunch Food Events for {format_target_date(result.target_date)}",
+                        f"Lunch Events with Food for {format_target_date(result.target_date)}",
                         bold=True,
                     )
                 ]
@@ -1349,7 +1349,7 @@ def build_slack_payload(
 
 def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Find CampusGroups lunch food events and optionally post them to Slack."
+        description="Find CampusGroups lunch events with food and optionally post them to Slack."
     )
     parser.add_argument(
         "--date",
