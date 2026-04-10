@@ -58,6 +58,27 @@ FLOOR_ORDER = ["2nd Floor", "1st Floor", "Lower Level"]
 DEFAULT_SPOTS_STATUS = "Unlimited"
 DEFAULT_TITLE_MAX_LENGTH = 110
 REVIEW_LABEL = "Review"
+DESCRIPTION_FOOD_LABEL = "Food Mentioned in Description"
+DESCRIPTION_FOOD_MATCHERS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("free food", re.compile(r"\bfree food\b", flags=re.IGNORECASE)),
+    (
+        "food provided",
+        re.compile(r"\bfood\s+(?:will\s+be\s+)?provided\b", flags=re.IGNORECASE),
+    ),
+    ("breakfast", re.compile(r"\bbreakfast\b", flags=re.IGNORECASE)),
+    ("brunch", re.compile(r"\bbrunch\b", flags=re.IGNORECASE)),
+    ("lunch", re.compile(r"\blunch\b", flags=re.IGNORECASE)),
+    ("dinner", re.compile(r"\bdinner\b", flags=re.IGNORECASE)),
+    ("snacks", re.compile(r"\bsnacks?\b", flags=re.IGNORECASE)),
+    ("refreshments", re.compile(r"\brefreshments?\b", flags=re.IGNORECASE)),
+    ("pizza", re.compile(r"\bpizza\b", flags=re.IGNORECASE)),
+    ("bagels", re.compile(r"\bbagels?\b", flags=re.IGNORECASE)),
+    ("sandwiches", re.compile(r"\bsandwich(?:es)?\b", flags=re.IGNORECASE)),
+    ("coffee", re.compile(r"\bcoffee\b", flags=re.IGNORECASE)),
+    ("catered", re.compile(r"\bcater(?:ed|ing)\b", flags=re.IGNORECASE)),
+    ("meal", re.compile(r"\bmeal(?:s)?\b", flags=re.IGNORECASE)),
+    ("dessert", re.compile(r"\bdesserts?\b", flags=re.IGNORECASE)),
+)
 SESSION_WARNING_TEXT = "🔸 CampusGroups login failed. Check `NORTHWESTERN_NETID` and `NORTHWESTERN_PASSWORD`."
 NETID_SELECTORS = [
     "input[name='IDToken1']",
@@ -198,6 +219,7 @@ class JsonLdEvent(BaseModel):
 class EventDetail(BaseModel):
     description: str | None = None
     food_provided: bool
+    description_food_match: str | None = None
     location_name: str | None = None
     address: str | None = None
     start_datetime: datetime | None = None
@@ -209,6 +231,7 @@ class FoodEvent(BaseModel):
     room_text: str | None = None
     event_url: str
     spots_status: str | None = None
+    food_detection_source: Literal["food_provided", "description"]
 
 
 class DigestResult(BaseModel):
@@ -879,6 +902,21 @@ def parse_event_start_datetime(value: str | None) -> datetime | None:
     return parsed.astimezone(DEFAULT_TIMEZONE)
 
 
+def detect_food_in_description(description: str | None) -> str | None:
+    if description is None:
+        return None
+
+    normalized = normalize_whitespace(description)
+    if not normalized:
+        return None
+
+    for label, pattern in DESCRIPTION_FOOD_MATCHERS:
+        if pattern.search(normalized):
+            return label
+
+    return None
+
+
 def is_lunch_start_datetime(start_datetime: datetime | None, target_date: date) -> bool:
     if start_datetime is None:
         return False
@@ -913,10 +951,14 @@ def parse_event_detail_html(html_text: str) -> EventDetail:
     food_provided = (
         re.search(r">\s*Food Provided\s*<", html_text, flags=re.IGNORECASE) is not None
     )
+    description_food_match = None
+    if not food_provided:
+        description_food_match = detect_food_in_description(description)
 
     return EventDetail(
         description=description,
         food_provided=food_provided,
+        description_food_match=description_food_match,
         location_name=location_name,
         address=address,
         start_datetime=start_datetime,
@@ -939,6 +981,7 @@ def fetch_event_detail(event_url: str, config: RuntimeConfig) -> EventDetail:
         extra={
             "event_url": event_url,
             "food_provided": detail.food_provided,
+            "description_food_match": detail.description_food_match,
             "has_location_name": detail.location_name is not None,
             "private_location": is_private_location(detail.location_name),
             "start_datetime": (
@@ -955,10 +998,18 @@ def build_food_event(
     event: PublicEvent, config: RuntimeConfig, target_date: date
 ) -> FoodEvent | None:
     detail = fetch_event_detail(event.event_url, config)
-    if not detail.food_provided:
+    if detail.food_provided:
+        food_detection_source: Literal["food_provided", "description"] = "food_provided"
+    elif detail.description_food_match is not None:
+        food_detection_source = "description"
+    else:
         LOGGER.info(
-            "Skipping event without food",
-            extra={"event_id": event.event_id, "event_title": event.title},
+            "Skipping event without food signal",
+            extra={
+                "event_id": event.event_id,
+                "event_title": event.title,
+                "description_food_match": detail.description_food_match,
+            },
         )
         return None
 
@@ -992,12 +1043,14 @@ def build_food_event(
         room_text=room_text,
         event_url=event.event_url,
         spots_status=event.spots_status,
+        food_detection_source=food_detection_source,
     )
     LOGGER.info(
         "Built food event",
         extra={
             "event_id": event.event_id,
             "event_title": event.title,
+            "food_detection_source": food_event.food_detection_source,
             "room_text": food_event.room_text,
         },
     )
@@ -1091,7 +1144,7 @@ def classify_floor(room_text: str | None) -> str | None:
     if room_text is None or is_private_location(room_text):
         return None
 
-    normalized = room_text.upper()
+    normalized = normalize_room_label(room_text).upper()
     if re.search(r"\b2\d{3}\b", normalized):
         return "2nd Floor"
     if re.search(r"\b1\d{3}\b", normalized):
@@ -1167,18 +1220,23 @@ def format_event_lines(event: FoodEvent) -> list[str]:
 
 def group_food_events(
     food_events: Sequence[FoodEvent],
-) -> tuple[dict[str, list[FoodEvent]], list[FoodEvent]]:
+) -> tuple[dict[str, list[FoodEvent]], list[FoodEvent], list[FoodEvent]]:
     grouped: dict[str, list[FoodEvent]] = {label: [] for label in FLOOR_ORDER}
     review: list[FoodEvent] = []
+    description_mentions: list[FoodEvent] = []
 
     for event in food_events:
+        if event.food_detection_source == "description":
+            description_mentions.append(event)
+            continue
+
         floor = classify_floor(event.room_text)
         if floor is None:
             review.append(event)
             continue
         grouped[floor].append(event)
 
-    return grouped, review
+    return grouped, review, description_mentions
 
 
 def build_event_room_list(event: FoodEvent) -> SlackRichTextList:
@@ -1234,7 +1292,7 @@ def build_slack_text(result: DigestResult | None, session_valid: bool) -> str:
             sections.append(SESSION_WARNING_TEXT)
         return "\n\n".join(sections)
 
-    grouped, review = group_food_events(result.food_events)
+    grouped, review, description_mentions = group_food_events(result.food_events)
 
     sections: list[str] = []
     for floor in FLOOR_ORDER:
@@ -1251,6 +1309,12 @@ def build_slack_text(result: DigestResult | None, session_valid: bool) -> str:
             line for event in review for line in format_event_lines(event)
         )
         sections.append(f"*{REVIEW_LABEL}*:\n\n{lines}")
+
+    if description_mentions:
+        lines = "\n".join(
+            line for event in description_mentions for line in format_event_lines(event)
+        )
+        sections.append(f"*{DESCRIPTION_FOOD_LABEL}*:\n\n{lines}")
 
     if not session_valid:
         sections.append(SESSION_WARNING_TEXT)
@@ -1318,7 +1382,7 @@ def build_slack_payload(
             blocks=blocks,
         )
 
-    grouped, review = group_food_events(result.food_events)
+    grouped, review, description_mentions = group_food_events(result.food_events)
     section_groups: list[list[SlackRichTextSection | SlackRichTextList]] = []
 
     for floor in FLOOR_ORDER:
@@ -1329,6 +1393,11 @@ def build_slack_payload(
 
     if review:
         section_groups.append(build_floor_elements(REVIEW_LABEL, review))
+
+    if description_mentions:
+        section_groups.append(
+            build_floor_elements(DESCRIPTION_FOOD_LABEL, description_mentions)
+        )
 
     body_elements: list[SlackRichTextSection | SlackRichTextList] = []
     for index, section_group in enumerate(section_groups):
