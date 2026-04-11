@@ -30,7 +30,7 @@ python campusgroups_food_digest.py --json
 
 ## GitHub Actions
 
-The daily workflow is [`.github/workflows/daily-food-digest.yml`](.github/workflows/daily-food-digest.yml). It runs at `6:25 AM` `America/Chicago`. Add these repository secrets before enabling it:
+The daily workflow is [`.github/workflows/daily-food-digest.yml`](.github/workflows/daily-food-digest.yml). It runs on weekdays at `6:25 AM` `America/Chicago`. Add these repository secrets before enabling it:
 
 - `NORTHWESTERN_NETID`
 - `NORTHWESTERN_PASSWORD`

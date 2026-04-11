@@ -3,7 +3,7 @@ name: Daily Food Digest
 on:
   workflow_dispatch:
   schedule:
-    - cron: "25 6 * * *"
+    - cron: "25 6 * * 1-5"
       timezone: "America/Chicago"
 
 permissions:
