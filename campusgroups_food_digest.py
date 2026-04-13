@@ -54,7 +54,8 @@ LONG_DATE_PATTERN = re.compile(
 USER_AGENT = "campusgroups-food-digest/1.0"
 PRIVATE_LOCATION_TEXT = "Private Location (sign in to display)"
 AUTHENTICATED_HOST = "kellogg.campusgroups.com"
-FLOOR_ORDER = ["2nd Floor", "1st Floor", "Lower Level"]
+WHITE_AUDITORIUM_LABEL = "White Auditorium"
+FLOOR_ORDER = ["2nd Floor", "1st Floor", "Lower Level", WHITE_AUDITORIUM_LABEL]
 DEFAULT_SPOTS_STATUS = "Unlimited"
 DEFAULT_TITLE_MAX_LENGTH = 110
 REVIEW_LABEL = "Review"
@@ -1140,11 +1141,13 @@ def validate_session(config: RuntimeConfig) -> bool:
     return session_valid
 
 
-def classify_floor(room_text: str | None) -> str | None:
+def classify_section_label(room_text: str | None) -> str | None:
     if room_text is None or is_private_location(room_text):
         return None
 
     normalized = normalize_room_label(room_text).upper()
+    if "WHITE AUDITORIUM" in normalized:
+        return WHITE_AUDITORIUM_LABEL
     if re.search(r"\b2\d{3}\b", normalized):
         return "2nd Floor"
     if re.search(r"\b1\d{3}\b", normalized):
@@ -1230,7 +1233,7 @@ def group_food_events(
             description_mentions.append(event)
             continue
 
-        floor = classify_floor(event.room_text)
+        floor = classify_section_label(event.room_text)
         if floor is None:
             review.append(event)
             continue
