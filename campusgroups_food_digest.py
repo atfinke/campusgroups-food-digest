@@ -19,6 +19,8 @@ from urllib.parse import urlencode, urljoin, urlparse
 from urllib.request import HTTPSHandler, ProxyHandler, Request, build_opener
 from zoneinfo import ZoneInfo
 
+from delivery_guard import DeliveryGuard
+
 from playwright.sync_api import (
     BrowserContext,
     Error as PlaywrightError,
@@ -1439,7 +1441,12 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         action="store_true",
         help="Print JSON output instead of plain text.",
     )
-    return parser.parse_args(argv)
+    parser.add_argument("--github-delivery-guard", action="store_true",
+                        help="Prevent repeat daily Slack delivery using durable GitHub refs.")
+    args = parser.parse_args(argv)
+    if args.github_delivery_guard and not args.send_slack:
+        parser.error("--github-delivery-guard requires --send-slack")
+    return args
 
 
 def run(config: RuntimeConfig, target_date: date) -> ScriptResult:
@@ -1477,8 +1484,14 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "date": args.date.isoformat() if args.date else None,
             },
         )
-        config = create_authenticated_runtime_config(load_runtime_config())
         target_date = resolve_target_date(args.date)
+        guard = DeliveryGuard.from_environment() if args.github_delivery_guard else None
+        if guard:
+            if guard.delivered(target_date):
+                LOGGER.info("Daily digest already delivered; skipping")
+                return 0
+            guard.ensure_available(target_date)
+        config = create_authenticated_runtime_config(load_runtime_config())
         result = run(
             config=config,
             target_date=target_date,
@@ -1489,14 +1502,23 @@ def main(argv: Sequence[str] | None = None) -> int:
                 raise RuntimeError(
                     "SLACK_WEBHOOK_URL is required when --send-slack is used."
                 )
+            if guard and not result.session_valid:
+                raise RuntimeError("Authentication failed; daily delivery remains eligible for retry")
+            payload = build_slack_payload(
+                result.digest_result, session_valid=result.session_valid,
+            ).model_dump(mode="json", exclude_none=True)
+            if guard and not guard.reserve(target_date):
+                if guard.delivered(target_date):
+                    LOGGER.info("Another run delivered the digest; skipping")
+                    return 0
+                raise RuntimeError("Another run reserved this delivery; inspect its outcome before retrying")
             post_json(
                 config.slack_webhook_url,
-                build_slack_payload(
-                    result.digest_result,
-                    session_valid=result.session_valid,
-                ).model_dump(mode="json", exclude_none=True),
+                payload,
                 timeout=DEFAULT_REQUEST_TIMEOUT_SECONDS,
             )
+            if guard:
+                guard.confirm(target_date)
 
         if args.json:
             sys.stdout.write(
