@@ -28,6 +28,8 @@ jobs:
       SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
       PYTHONUNBUFFERED: "1"
       GITHUB_TOKEN: ${{ github.token }}
+      FEEDBACK_API_URL: ${{ secrets.FEEDBACK_API_URL }}
+      FEEDBACK_API_TOKEN: ${{ secrets.FEEDBACK_API_TOKEN }}
       DIGEST_DATE: ${{ inputs.digest_date }}
     steps:
       - name: Check out repository

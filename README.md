@@ -139,10 +139,24 @@ No real CampusGroups login, Slack post, or dispatch is needed for these tests:
 ```bash
 python -m pip install -r requirements.txt
 python -m unittest discover -s tests -v
-node --test watchdog/worker.test.mjs
+node --test watchdog/worker.test.mjs feedback/*.test.mjs
 ```
 
 The test workflow runs on pushes and pull requests without delivery secrets.
 Tests cover duplicate skips, claim conflicts, API failures, authentication and
 collection failures, uncertain Slack outcomes, receipt-write failures, fallback
 dispatches, active runs, weekends, and the Chicago daylight-saving offset.
+
+## Student feedback in Slack
+
+The optional [feedback service](feedback/README.md) listens to ordinary student messages
+and thread replies in the food channel. An LLM structures food observations, with source
+evidence, event matching, location, quantity, food types, and reported/inferred vendors.
+The existing digest supplies all daily event candidates so reports can reveal missed food
+events. Persistent reports and distinct-event club summaries support review and later
+improvements; automatic predictions are not enabled.
+
+Activation requires a Slack app event subscription, Cloudflare Worker/D1/Queues deployment,
+and an OpenAI API key. Optional repository secrets `FEEDBACK_API_URL` and
+`FEEDBACK_API_TOKEN` connect the daily workflow. Missing configuration or upload failures
+do not block the digest. See the linked setup guide and app manifest for the exact steps.

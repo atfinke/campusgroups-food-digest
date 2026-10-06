@@ -20,6 +20,7 @@ from urllib.request import HTTPSHandler, ProxyHandler, Request, build_opener
 from zoneinfo import ZoneInfo
 
 from delivery_guard import DeliveryGuard
+from feedback_client import publish_event_snapshot
 
 from playwright.sync_api import (
     BrowserContext,
@@ -243,6 +244,7 @@ class DigestResult(BaseModel):
     total_entries: int
     matching_event_count: int
     food_events: list[FoodEvent]
+    matching_events: list[PublicEvent] = Field(default_factory=list)
 
 
 class ScriptResult(BaseModel):
@@ -1109,6 +1111,7 @@ def collect_food_events(
         total_entries=len(entries),
         matching_event_count=len(matching_events),
         food_events=food_events,
+        matching_events=matching_events,
     )
     LOGGER.info(
         "Finished collecting food events",
@@ -1441,6 +1444,8 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         action="store_true",
         help="Print JSON output instead of plain text.",
     )
+    parser.add_argument("--publish-feedback-context", action="store_true",
+                        help="Upload event context without posting to Slack (requires feedback configuration).")
     parser.add_argument("--github-delivery-guard", action="store_true",
                         help="Prevent repeat daily Slack delivery using durable GitHub refs.")
     args = parser.parse_args(argv)
@@ -1496,6 +1501,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             config=config,
             target_date=target_date,
         )
+
+        if (args.send_slack or args.publish_feedback_context) and result.session_valid and result.digest_result is not None:
+            published = publish_event_snapshot(result.digest_result)
+            if args.publish_feedback_context and not published:
+                raise RuntimeError("Requested feedback context upload failed or is not configured")
 
         if args.send_slack:
             if config.slack_webhook_url is None:

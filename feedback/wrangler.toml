@@ -1,0 +1,37 @@
+name = "campusgroups-food-feedback"
+main = "worker.mjs"
+compatibility_date = "2026-10-06"
+workers_dev = true
+
+[vars]
+# Replace with IDs, not display names. Only this workspace/channel is ingested.
+SLACK_TEAM_ID = "REPLACE_WITH_WORKSPACE_ID"
+SLACK_CHANNEL_ID = "REPLACE_WITH_FOOD_CHANNEL_ID"
+OPENAI_MODEL = "gpt-4.1-mini"
+# Enable reactions/thread clarification only after extraction has been reviewed.
+SLACK_ACKNOWLEDGEMENTS = "false"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "campusgroups-food-feedback"
+database_id = "REPLACE_WITH_DATABASE_ID"
+migrations_dir = "migrations"
+
+[[queues.producers]]
+binding = "FEEDBACK_QUEUE"
+queue = "campusgroups-food-feedback"
+
+[[queues.consumers]]
+queue = "campusgroups-food-feedback"
+max_batch_size = 1
+max_batch_timeout = 1
+max_concurrency = 1
+max_retries = 3
+retry_delay = 60
+dead_letter_queue = "campusgroups-food-feedback-dead-letter"
+
+[observability]
+enabled = true
+# Slack text and bearer credentials should not be logged as HTTP invocation data.
+[observability.logs]
+invocation_logs = false
