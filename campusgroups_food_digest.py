@@ -12,10 +12,11 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import date, datetime
 from html import unescape
+from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any, Literal, Sequence
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlencode, urljoin, urlparse
+from urllib.parse import parse_qs, urlencode, urljoin, urlparse
 from urllib.request import HTTPSHandler, ProxyHandler, Request, build_opener
 from zoneinfo import ZoneInfo
 
@@ -802,7 +803,25 @@ def normalize_spots_status(value: str | None) -> str | None:
 
 def build_event_url(config: RuntimeConfig, entry: CampusGroupsListEntry) -> str | None:
     if entry.event_url_path:
-        return urljoin(DEFAULT_BASE_URL, entry.event_url_path)
+        event_url = urljoin(DEFAULT_BASE_URL, entry.event_url_path)
+        parsed = urlparse(event_url)
+        query = parse_qs(unescape(parsed.query))
+        # Event feeds are activity pages, not the structured RSVP detail page.
+        # Only rewrite a known route when its event ID agrees with the listing.
+        if (
+            parsed.scheme == "https"
+            and parsed.netloc == AUTHENTICATED_HOST
+            and re.fullmatch(r"/(?:[^/]+/)?feeds/?", parsed.path, re.IGNORECASE)
+            and query.get("type") == ["event"]
+            and entry.primary_value is not None
+            and entry.primary_value.isdigit()
+            and query.get("type_id") == [entry.primary_value]
+        ):
+            return urljoin(
+                DEFAULT_BASE_URL,
+                DEFAULT_EVENT_PATH_TEMPLATE.format(event_id=entry.primary_value),
+            )
+        return event_url
     if entry.primary_value and entry.primary_value.isdigit():
         path = DEFAULT_EVENT_PATH_TEMPLATE.format(event_id=entry.primary_value)
         return urljoin(DEFAULT_BASE_URL, path)
@@ -934,6 +953,31 @@ def is_lunch_start_datetime(start_datetime: datetime | None, target_date: date) 
     return LUNCH_WINDOW_START_MINUTES <= start_minutes < LUNCH_WINDOW_END_MINUTES
 
 
+class FoodLabelParser(HTMLParser):
+    """Read label text without treating comments, attributes, or code as labels."""
+
+    NON_CONTENT_TAGS = {"script", "style", "template", "noscript"}
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.non_content_depth = 0
+        self.food_provided = False
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag in self.NON_CONTENT_TAGS:
+            self.non_content_depth += 1
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag in self.NON_CONTENT_TAGS:
+            self.non_content_depth = max(0, self.non_content_depth - 1)
+
+    def handle_data(self, data: str) -> None:
+        if not self.non_content_depth and re.match(
+            r"^Food\s+Provided\b", data.strip(), flags=re.IGNORECASE
+        ):
+            self.food_provided = True
+
+
 def parse_event_detail_html(html_text: str) -> EventDetail:
     json_ld = extract_json_ld_event(html_text)
     description = None
@@ -953,9 +997,9 @@ def parse_event_detail_html(html_text: str) -> EventDetail:
     if description is None:
         description = extract_meta_description(html_text)
 
-    food_provided = (
-        re.search(r">\s*Food Provided\s*<", html_text, flags=re.IGNORECASE) is not None
-    )
+    food_label_parser = FoodLabelParser()
+    food_label_parser.feed(html_text)
+    food_provided = food_label_parser.food_provided
     description_food_match = None
     if not food_provided:
         description_food_match = detect_food_in_description(description)
