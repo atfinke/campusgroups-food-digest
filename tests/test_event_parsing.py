@@ -130,5 +130,41 @@ class EventUrlTests(unittest.TestCase):
             self.assertIsNone(digest.build_food_event(event, self.config, DAY))
 
 
+class RoomClassificationTests(unittest.TestCase):
+    def test_registration_gate_does_not_claim_session_is_missing(self):
+        self.assertEqual(digest.normalize_room_label("Private Location (register to display)"),
+                         "Private Location (register to display)")
+        self.assertEqual(digest.normalize_room_label("Private Location (sign in to display)"),
+                         "Requires Session ID")
+
+    def test_room_suffixes_ranges_and_combined_rooms(self):
+        cases = (
+            ("KGH - 2410A&amp;B", "2nd Floor"),
+            ("2410A-2410B", "2nd Floor"),
+            ("KGH 1420–1430", "1st Floor"),
+        )
+        for room, expected in cases:
+            with self.subTest(room=room):
+                self.assertEqual(digest.classify_section_label(room), expected)
+
+    def test_street_address_does_not_override_or_invent_room_floor(self):
+        cases = (
+            ("KGH 1420&amp;1430 2211 Campus Dr., Evanston, Illi 60208, United States", "1st Floor"),
+            ("2211 Campus Dr., Evanston, IL 60208", None),
+            ("White Auditorium, 2211 Campus Dr.", "White Auditorium"),
+        )
+        for room, expected in cases:
+            with self.subTest(room=room):
+                self.assertEqual(digest.classify_section_label(room), expected)
+
+    def test_ambiguous_or_unknown_rooms_remain_unclassified(self):
+        for room in (
+            "Private Location (register to display)", "TBD",
+            "KGH 1420 & 2410", "KGH 1420 & 3100",
+        ):
+            with self.subTest(room=room):
+                self.assertIsNone(digest.classify_section_label(room))
+
+
 if __name__ == "__main__":
     unittest.main()

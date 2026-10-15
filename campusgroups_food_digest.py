@@ -1194,16 +1194,21 @@ def classify_section_label(room_text: str | None) -> str | None:
     if room_text is None or is_private_location(room_text):
         return None
 
-    normalized = normalize_room_label(room_text).upper()
+    normalized = normalize_room_label(unescape(room_text)).upper()
     if "WHITE AUDITORIUM" in normalized:
         return WHITE_AUDITORIUM_LABEL
-    if re.search(r"\b2\d{3}\b", normalized):
-        return "2nd Floor"
-    if re.search(r"\b1\d{3}\b", normalized):
-        return "1st Floor"
-    if re.search(r"\bL\d+\b", normalized):
-        return "Lower Level"
-    return None
+    # A location may append its mailing address. Street numbers are not rooms.
+    normalized = re.sub(
+        r"\b\d+\s+(?:[A-Z][A-Z.'-]*\s+){1,5}"
+        r"(?:STREET|ST|ROAD|RD|DRIVE|DR|AVENUE|AVE|BOULEVARD|BLVD|LANE|LN|COURT|CT|WAY|PLACE|PL)\b\.?",
+        "",
+        normalized,
+    )
+    rooms = re.findall(r"\b(L\d+|\d{4})[A-Z]{0,2}\b", normalized)
+    floors = {"1": "1st Floor", "2": "2nd Floor", "L": "Lower Level"}
+    labels = {floors.get(room[0]) for room in rooms}
+    # Combined rooms/ranges must agree; an unknown or mixed floor needs review.
+    return labels.pop() if len(labels) == 1 else None
 
 
 def format_target_date(target_date: date) -> str:
@@ -1214,6 +1219,8 @@ def normalize_room_label(room_text: str | None) -> str:
     if room_text is None:
         return "Unknown room"
     if is_private_location(room_text):
+        if "register to display" in room_text.casefold():
+            return "Private Location (register to display)"
         return "Requires Session ID"
     normalized = normalize_whitespace(room_text)
     normalized = re.sub(r"\s*-\s*(\d{3,4})\b", r" \1", normalized)
