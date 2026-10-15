@@ -12,10 +12,11 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import date, datetime
 from html import unescape
+from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any, Literal, Sequence
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlencode, urljoin, urlparse
+from urllib.parse import parse_qs, urlencode, urljoin, urlparse
 from urllib.request import HTTPSHandler, ProxyHandler, Request, build_opener
 from zoneinfo import ZoneInfo
 
@@ -802,7 +803,25 @@ def normalize_spots_status(value: str | None) -> str | None:
 
 def build_event_url(config: RuntimeConfig, entry: CampusGroupsListEntry) -> str | None:
     if entry.event_url_path:
-        return urljoin(DEFAULT_BASE_URL, entry.event_url_path)
+        event_url = urljoin(DEFAULT_BASE_URL, entry.event_url_path)
+        parsed = urlparse(event_url)
+        query = parse_qs(unescape(parsed.query))
+        # Event feeds are activity pages, not the structured RSVP detail page.
+        # Only rewrite a known route when its event ID agrees with the listing.
+        if (
+            parsed.scheme == "https"
+            and parsed.netloc == AUTHENTICATED_HOST
+            and re.fullmatch(r"/(?:[^/]+/)?feeds/?", parsed.path, re.IGNORECASE)
+            and query.get("type") == ["event"]
+            and entry.primary_value is not None
+            and entry.primary_value.isdigit()
+            and query.get("type_id") == [entry.primary_value]
+        ):
+            return urljoin(
+                DEFAULT_BASE_URL,
+                DEFAULT_EVENT_PATH_TEMPLATE.format(event_id=entry.primary_value),
+            )
+        return event_url
     if entry.primary_value and entry.primary_value.isdigit():
         path = DEFAULT_EVENT_PATH_TEMPLATE.format(event_id=entry.primary_value)
         return urljoin(DEFAULT_BASE_URL, path)
@@ -934,6 +953,31 @@ def is_lunch_start_datetime(start_datetime: datetime | None, target_date: date) 
     return LUNCH_WINDOW_START_MINUTES <= start_minutes < LUNCH_WINDOW_END_MINUTES
 
 
+class FoodLabelParser(HTMLParser):
+    """Read label text without treating comments, attributes, or code as labels."""
+
+    NON_CONTENT_TAGS = {"script", "style", "template", "noscript"}
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.non_content_depth = 0
+        self.food_provided = False
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag in self.NON_CONTENT_TAGS:
+            self.non_content_depth += 1
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag in self.NON_CONTENT_TAGS:
+            self.non_content_depth = max(0, self.non_content_depth - 1)
+
+    def handle_data(self, data: str) -> None:
+        if not self.non_content_depth and re.match(
+            r"^Food\s+Provided\b", data.strip(), flags=re.IGNORECASE
+        ):
+            self.food_provided = True
+
+
 def parse_event_detail_html(html_text: str) -> EventDetail:
     json_ld = extract_json_ld_event(html_text)
     description = None
@@ -953,9 +997,9 @@ def parse_event_detail_html(html_text: str) -> EventDetail:
     if description is None:
         description = extract_meta_description(html_text)
 
-    food_provided = (
-        re.search(r">\s*Food Provided\s*<", html_text, flags=re.IGNORECASE) is not None
-    )
+    food_label_parser = FoodLabelParser()
+    food_label_parser.feed(html_text)
+    food_provided = food_label_parser.food_provided
     description_food_match = None
     if not food_provided:
         description_food_match = detect_food_in_description(description)
@@ -1150,16 +1194,21 @@ def classify_section_label(room_text: str | None) -> str | None:
     if room_text is None or is_private_location(room_text):
         return None
 
-    normalized = normalize_room_label(room_text).upper()
+    normalized = normalize_room_label(unescape(room_text)).upper()
     if "WHITE AUDITORIUM" in normalized:
         return WHITE_AUDITORIUM_LABEL
-    if re.search(r"\b2\d{3}\b", normalized):
-        return "2nd Floor"
-    if re.search(r"\b1\d{3}\b", normalized):
-        return "1st Floor"
-    if re.search(r"\bL\d+\b", normalized):
-        return "Lower Level"
-    return None
+    # A location may append its mailing address. Street numbers are not rooms.
+    normalized = re.sub(
+        r"\b\d+\s+(?:[A-Z][A-Z.'-]*\s+){1,5}"
+        r"(?:STREET|ST|ROAD|RD|DRIVE|DR|AVENUE|AVE|BOULEVARD|BLVD|LANE|LN|COURT|CT|WAY|PLACE|PL)\b\.?",
+        "",
+        normalized,
+    )
+    rooms = re.findall(r"\b(L\d+|\d{4})[A-Z]{0,2}\b", normalized)
+    floors = {"1": "1st Floor", "2": "2nd Floor", "L": "Lower Level"}
+    labels = {floors.get(room[0]) for room in rooms}
+    # Combined rooms/ranges must agree; an unknown or mixed floor needs review.
+    return labels.pop() if len(labels) == 1 else None
 
 
 def format_target_date(target_date: date) -> str:
@@ -1170,6 +1219,8 @@ def normalize_room_label(room_text: str | None) -> str:
     if room_text is None:
         return "Unknown room"
     if is_private_location(room_text):
+        if "register to display" in room_text.casefold():
+            return "Private Location (register to display)"
         return "Requires Session ID"
     normalized = normalize_whitespace(room_text)
     normalized = re.sub(r"\s*-\s*(\d{3,4})\b", r" \1", normalized)
