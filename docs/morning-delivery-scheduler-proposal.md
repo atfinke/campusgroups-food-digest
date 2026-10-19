@@ -53,12 +53,12 @@ earlier, rather than build another scheduler.
 ## Proposed behavior and implementation scope
 
 1. Keep the native 06:25 GitHub schedule as one delivery path.
-2. Move the watchdog's Chicago window to 06:40 through 10:45 on weekdays, checking
+2. Move the watchdog's Chicago window to 06:40 through 10:40 on weekdays, checking
    every 15 minutes from the first check: 06:40, 06:55, 07:10, and so on.
    A first check at 06:40 gives the native schedule 15 minutes to start.
 3. Update both the UTC cron coverage and the handler's local-time filter together.
    A proposed UTC trigger is `10,25,40,55 11-16 * * *`, with the handler allowing
-   only Chicago weekday minutes from 400 through 645 inclusive. That covers both
+   only Chicago weekday minutes from 400 through 640 inclusive. That covers both
    daylight and standard time; the local filter must reject the extra invocations.
 4. Preserve the existing behavior: check the delivered receipt first; stop and
    surface an error on an unconfirmed reservation; allow a recent active main
