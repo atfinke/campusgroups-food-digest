@@ -1222,10 +1222,12 @@ def normalize_room_label(room_text: str | None) -> str:
         if "register to display" in room_text.casefold():
             return "Private Location (register to display)"
         return "Requires Session ID"
-    normalized = normalize_whitespace(room_text)
+    # Room labels can include appended meeting URLs; keep links out of display text.
+    without_urls = re.sub(r"https?://\S+", "", room_text, flags=re.IGNORECASE)
+    normalized = normalize_whitespace(without_urls).strip(" ;,")
     normalized = re.sub(r"\s*-\s*(\d{3,4})\b", r" \1", normalized)
     normalized = re.sub(r"\b([A-Z]{2,}?)(L?\d{3,4})\b", r"\1 \2", normalized)
-    return normalized
+    return normalized or "Unknown room"
 
 
 def truncate_title(title: str, max_length: int = DEFAULT_TITLE_MAX_LENGTH) -> str:
