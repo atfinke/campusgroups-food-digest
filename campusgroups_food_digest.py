@@ -21,7 +21,7 @@ from urllib.parse import parse_qs, urlencode, urljoin, urlparse
 from urllib.request import HTTPSHandler, ProxyHandler, Request, build_opener
 from zoneinfo import ZoneInfo
 
-from delivery_guard import DeliveryGuard
+from delivery_guard import DeliveryGuard, CorrectionGuard
 from feedback_client import publish_event_snapshot
 
 from playwright.sync_api import (
@@ -1602,7 +1602,11 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         "--dry-run", action="store_true",
         help="Recollect and validate without Slack, feedback upload, or delivery guard writes.",
     )
+    parser.add_argument("--correction", action="store_true",
+                        help="Send one labeled correction for an explicitly dated, already-delivered digest.")
     args = parser.parse_args(argv)
+    if args.correction and (not args.date or not args.send_slack or not args.github_delivery_guard or args.dry_run):
+        parser.error("--correction requires --date, --send-slack and --github-delivery-guard, without --dry-run")
     if args.dry_run and (args.send_slack or args.github_delivery_guard or args.publish_feedback_context):
         parser.error("--dry-run cannot be combined with delivery or feedback publishing")
     if args.github_delivery_guard and not args.send_slack:
@@ -1647,6 +1651,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         target_date = resolve_target_date(args.date)
         guard = DeliveryGuard.from_environment() if args.github_delivery_guard else None
+        if args.correction:
+            if not guard.delivered(target_date):
+                raise RuntimeError("Correction requires an existing original delivered receipt")
+            guard = CorrectionGuard.from_environment()
         if guard:
             if guard.delivered(target_date):
                 LOGGER.info("Daily digest already delivered; skipping")
@@ -1673,6 +1681,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             payload = build_slack_payload(
                 result.digest_result, session_valid=result.session_valid,
             ).model_dump(mode="json", exclude_none=True)
+            if args.correction:
+                label = f"Correction for {target_date.isoformat()}: this replaces the earlier digest for this date."
+                payload["text"] = label + "\n\n" + payload["text"]
+                payload.setdefault("blocks", []).insert(0, {
+                    "type": "section", "text": {"type": "plain_text", "text": label},
+                })
             if guard and not guard.reserve(target_date):
                 if guard.delivered(target_date):
                     LOGGER.info("Another run delivered the digest; skipping")
