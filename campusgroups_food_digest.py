@@ -40,7 +40,7 @@ DEFAULT_EVENTS_PATH = "/mobile_ws/v17/mobile_events_list"
 DEFAULT_AUTH_CHECK_PATH = "/groups"
 DEFAULT_EVENT_PATH_TEMPLATE = "/rsvp_boot?id={event_id}"
 DEFAULT_LIMIT = 500
-DEFAULT_MAX_WORKERS = 8
+DEFAULT_MAX_WORKERS = 2
 RENDER_SLOTS = BoundedSemaphore(2)
 DEFAULT_REQUEST_TIMEOUT_SECONDS = 30
 DEFAULT_REQUEST_RETRIES = 3
@@ -1045,6 +1045,20 @@ def parse_rendered_event_fields(fields: dict[str, Any]) -> EventDetail:
 
 
 def fetch_rendered_event_detail(event_url: str, config: RuntimeConfig) -> EventDetail:
+    for attempt in range(1, 3):
+        try:
+            return fetch_rendered_event_detail_once(event_url, config)
+        except PlaywrightTimeoutError:
+            LOGGER.warning("Rendered event timed out", extra={
+                "event_url": event_url, "attempt": attempt, "retrying": attempt < 2,
+            })
+            if attempt == 2:
+                raise
+            time.sleep(2)
+    raise RuntimeError("Rendered event retry limit exhausted")
+
+
+def fetch_rendered_event_detail_once(event_url: str, config: RuntimeConfig) -> EventDetail:
     # Browser contexts retain the full authenticated cookie/local-storage state.
     # Bound browser launches independently from concurrent HTTP list requests.
     with RENDER_SLOTS, sync_playwright() as playwright:
