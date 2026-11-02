@@ -669,6 +669,9 @@ def fetch_text(url: str, headers: dict[str, str], timeout: int) -> str:
                         "attempt": attempt,
                         "status_code": response.status,
                         "body_bytes": len(body),
+                        "response_host": urlparse(response.geturl()).netloc,
+                        "response_path": urlparse(response.geturl()).path,
+                        "content_type": response.headers.get_content_type(),
                     },
                 )
                 return body.decode(charset)
@@ -1025,6 +1028,14 @@ def fetch_event_detail(event_url: str, config: RuntimeConfig) -> EventDetail:
         event_url, headers=headers, timeout=DEFAULT_REQUEST_TIMEOUT_SECONDS
     )
     detail = parse_event_detail_html(html_text)
+    # A 200 response can be a login redirect, interstitial, or JS-only shell.
+    # Missing event data must not silently become a trustworthy empty digest.
+    if detail.start_datetime is None:
+        raise RuntimeError(
+            "Event detail validation failed: missing start datetime; "
+            "possible authentication redirect or changed page format "
+            f"(event_url={event_url}, body_bytes={len(html_text.encode('utf-8'))})"
+        )
     LOGGER.info(
         "Parsed event detail page",
         extra={
@@ -1501,7 +1512,13 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
                         help="Upload event context without posting to Slack (requires feedback configuration).")
     parser.add_argument("--github-delivery-guard", action="store_true",
                         help="Prevent repeat daily Slack delivery using durable GitHub refs.")
+    parser.add_argument(
+        "--dry-run", action="store_true",
+        help="Recollect and validate without Slack, feedback upload, or delivery guard writes.",
+    )
     args = parser.parse_args(argv)
+    if args.dry_run and (args.send_slack or args.github_delivery_guard or args.publish_feedback_context):
+        parser.error("--dry-run cannot be combined with delivery or feedback publishing")
     if args.github_delivery_guard and not args.send_slack:
         parser.error("--github-delivery-guard requires --send-slack")
     return args
@@ -1583,6 +1600,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             if guard:
                 guard.confirm(target_date)
 
+        if args.dry_run:
+            LOGGER.info("Diagnostic dry run complete; no delivery or feedback writes performed")
         if args.json:
             sys.stdout.write(
                 f"{json.dumps(result.model_dump(mode='json'), indent=2)}\n"
@@ -1600,3 +1619,4 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
