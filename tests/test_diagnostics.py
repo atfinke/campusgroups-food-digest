@@ -6,6 +6,26 @@ import campusgroups_food_digest as digest
 
 
 class DiagnosticTests(unittest.TestCase):
+    def test_render_timeout_retries_once(self):
+        expected = digest.EventDetail(food_provided=False)
+        with patch.object(digest, "fetch_rendered_event_detail_once", side_effect=[digest.PlaywrightTimeoutError("timeout"), expected]) as fetch, \
+             patch.object(digest.time, "sleep"):
+            self.assertEqual(digest.fetch_rendered_event_detail("https://example.invalid", Mock()), expected)
+            self.assertEqual(fetch.call_count, 2)
+
+    def test_render_timeout_exhaustion_fails(self):
+        with patch.object(digest, "fetch_rendered_event_detail_once", side_effect=digest.PlaywrightTimeoutError("timeout")) as fetch, \
+             patch.object(digest.time, "sleep"):
+            with self.assertRaises(digest.PlaywrightTimeoutError):
+                digest.fetch_rendered_event_detail("https://example.invalid", Mock())
+            self.assertEqual(fetch.call_count, 2)
+
+    def test_validation_errors_are_not_retried(self):
+        with patch.object(digest, "fetch_rendered_event_detail_once", side_effect=RuntimeError("invalid data")) as fetch:
+            with self.assertRaises(RuntimeError):
+                digest.fetch_rendered_event_detail("https://example.invalid", Mock())
+            self.assertEqual(fetch.call_count, 1)
+
     def test_dry_run_recollects_without_external_writes(self):
         result = Mock(session_valid=True, slack_text="No lunch events")
         with patch.object(digest, "create_authenticated_runtime_config") as auth, \
