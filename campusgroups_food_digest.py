@@ -8,6 +8,7 @@ import re
 import ssl
 import sys
 import time
+from threading import BoundedSemaphore
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import date, datetime
@@ -40,6 +41,7 @@ DEFAULT_AUTH_CHECK_PATH = "/groups"
 DEFAULT_EVENT_PATH_TEMPLATE = "/rsvp_boot?id={event_id}"
 DEFAULT_LIMIT = 500
 DEFAULT_MAX_WORKERS = 8
+RENDER_SLOTS = BoundedSemaphore(2)
 DEFAULT_REQUEST_TIMEOUT_SECONDS = 30
 DEFAULT_REQUEST_RETRIES = 3
 DEFAULT_REQUEST_RETRY_BACKOFF_SECONDS = 1.0
@@ -159,6 +161,7 @@ class StructuredLogFormatter(logging.Formatter):
 
 class RuntimeConfig(BaseModel):
     session_id: str | None = None
+    browser_storage_state: dict[str, Any] | None = Field(default=None, exclude=True, repr=False)
     slack_webhook_url: str | None = None
     netid: str | None = None
     password: str | None = None
@@ -597,7 +600,10 @@ def create_authenticated_runtime_config(config: RuntimeConfig) -> RuntimeConfig:
                         },
                     )
                     return config.model_copy(
-                        update={"session_id": cookie_map["CG.SessionID"]}
+                        update={
+                            "session_id": cookie_map["CG.SessionID"],
+                            "browser_storage_state": context.storage_state(),
+                        }
                     )
 
                 current_host = urlparse(page.url).netloc
@@ -1017,6 +1023,69 @@ def parse_event_detail_html(html_text: str) -> EventDetail:
     )
 
 
+def parse_rendered_event_fields(fields: dict[str, Any]) -> EventDetail:
+    """Parse the new CampusGroups event UI, never treating a shell as an event."""
+    match = re.search(
+        r"([A-Z][a-z]{2}, [A-Z][a-z]{2} \d{1,2}, \d{4}, \d{1,2}:\d{2} [AP]M)",
+        fields.get("date_text") or "",
+    )
+    if not fields.get("title") or match is None:
+        raise RuntimeError("Rendered event validation failed: missing title or start datetime")
+    start = datetime.strptime(match.group(1), "%a, %b %d, %Y, %I:%M %p").replace(tzinfo=DEFAULT_TIMEZONE)
+    description = normalize_whitespace(fields.get("description") or "") or None
+    food = bool(fields.get("food_provided"))
+    location = clean_room_text(fields.get("location") or "")
+    if location and "after registration" in location.casefold():
+        location = "Private Location (register to display)"
+    return EventDetail(
+        start_datetime=start, description=description, location_name=location,
+        food_provided=food,
+        description_food_match=None if food else detect_food_in_description(description),
+    )
+
+
+def fetch_rendered_event_detail(event_url: str, config: RuntimeConfig) -> EventDetail:
+    # Browser contexts retain the full authenticated cookie/local-storage state.
+    # Bound browser launches independently from concurrent HTTP list requests.
+    with RENDER_SLOTS, sync_playwright() as playwright:
+        browser = playwright.chromium.launch(headless=True)
+        try:
+            context = browser.new_context(
+                storage_state=config.browser_storage_state,
+                timezone_id="America/Chicago",
+            )
+            page = context.new_page()
+            page.goto(event_url, wait_until="domcontentloaded", timeout=30_000)
+            page.locator("h1").wait_for(timeout=30_000)
+            page.wait_for_function(
+                """() => [...document.querySelectorAll('span')].some(
+                    e => e.textContent.trim() === 'date_range')""",
+                timeout=30_000,
+            )
+            fields = page.evaluate("""() => {
+                const icon = name => [...document.querySelectorAll('span')]
+                    .find(e => e.textContent.trim() === name);
+                const details = [...document.querySelectorAll('h2')]
+                    .find(e => e.textContent.trim() === 'Event Details');
+                return {
+                    title: document.querySelector('h1')?.textContent,
+                    date_text: icon('date_range')?.parentElement?.textContent,
+                    location: icon('location_on')?.parentElement?.querySelector('p')?.textContent,
+                    description: details?.parentElement?.querySelector('[data-slot="view-more-content"]')?.textContent,
+                    food_provided: [...document.querySelectorAll('h3')].some(
+                        e => e.textContent.replace('lunch_dining', '').trim() === 'Food Provided'),
+                };
+            }""")
+            final = urlparse(page.url)
+            LOGGER.info("Rendered event page", extra={
+                "response_host": final.netloc, "response_path": final.path,
+                "has_title": bool(fields.get("title")),
+            })
+            return parse_rendered_event_fields(fields)
+        finally:
+            browser.close()
+
+
 def fetch_event_detail(event_url: str, config: RuntimeConfig) -> EventDetail:
     LOGGER.info("Fetching event detail page", extra={"event_url": event_url})
     headers = {
@@ -1028,6 +1097,9 @@ def fetch_event_detail(event_url: str, config: RuntimeConfig) -> EventDetail:
         event_url, headers=headers, timeout=DEFAULT_REQUEST_TIMEOUT_SECONDS
     )
     detail = parse_event_detail_html(html_text)
+    if detail.start_datetime is None:
+        LOGGER.info("Static event data missing; trying rendered page", extra={"event_url": event_url})
+        detail = fetch_rendered_event_detail(event_url, config)
     # A 200 response can be a login redirect, interstitial, or JS-only shell.
     # Missing event data must not silently become a trustworthy empty digest.
     if detail.start_datetime is None:
