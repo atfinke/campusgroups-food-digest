@@ -120,11 +120,20 @@ class EventUrlTests(unittest.TestCase):
         self.assertIsNotNone(result)
         self.assertEqual(result.room_text, "Example room")
 
-        for start in (None, "invalid", "2026-10-15T10:59:00-05:00", "2026-10-15T15:00:00-05:00", "2026-10-16T12:15:00-05:00"):
+        for start in ("2026-10-15T10:59:00-05:00", "2026-10-15T15:00:00-05:00", "2026-10-16T12:15:00-05:00"):
             with self.subTest(start=start), patch.object(
                 digest, "fetch_text", return_value=detail_html("<div>Food Provided (lunch)</div>", start)
             ):
                 self.assertIsNone(digest.build_food_event(event, self.config, DAY))
+
+        # Missing dates now require rendering, and remain failures if rendering
+        # cannot recover a real event. Unit tests must not launch live browsers.
+        for start in (None, "invalid"):
+            with self.subTest(start=start), patch.object(
+                digest, "fetch_text", return_value=detail_html("<div>Food Provided</div>", start)
+            ), patch.object(digest, "fetch_rendered_event_detail", side_effect=RuntimeError("invalid rendered event")):
+                with self.assertRaisesRegex(RuntimeError, "invalid rendered event"):
+                    digest.build_food_event(event, self.config, DAY)
 
         with patch.object(digest, "fetch_text", return_value=detail_html("<!-- <div>Food Provided</div> -->")):
             self.assertIsNone(digest.build_food_event(event, self.config, DAY))
