@@ -35,3 +35,18 @@ there must be no additional Slack message and the existing receipt must remain.
 Investigate the returned host/path and parser before sending any correction.
 Repeat the same collection-quality check on the next weekday's morning run.
 Scheduler/watchdog deployment changes are separate and not implemented here.
+
+## New event UI fallback
+
+Live browser inspection confirmed that legacy `rsvp_boot` links redirect to a
+JavaScript-rendered `/w/.../events/...` UI. A known November 2 event displays
+Food Provided and a noon start in the rendered DOM, despite the static 1,016-byte
+shell containing neither. If static metadata has no date, collection now renders
+the event using Playwright with the full in-memory authenticated storage state.
+The state is excluded from model serialization and representation and is never
+saved as an artifact. At most two fallback browsers run concurrently.
+
+The fallback reads the event title, date icon row, location, description, and
+explicit Food Provided heading. Its context uses America/Chicago for date parsing.
+Missing title/date or browser errors still fail collection before delivery.
+This covers the observed UI; future markup changes may require another adapter.
