@@ -12,6 +12,11 @@ on:
         required: false
         default: false
         type: boolean
+      correction:
+        description: "Send one labeled correction (explicit date and existing delivery required)"
+        required: false
+        default: false
+        type: boolean
   schedule:
     - cron: "25 6 * * 1-5"
       timezone: "America/Chicago"
@@ -37,6 +42,7 @@ jobs:
       FEEDBACK_API_TOKEN: ${{ secrets.FEEDBACK_API_TOKEN }}
       DIGEST_DATE: ${{ inputs.digest_date }}
       DRY_RUN: ${{ inputs.dry_run }}
+      CORRECTION: ${{ inputs.correction }}
     steps:
       - name: Check out repository
         uses: actions/checkout@v5
@@ -74,6 +80,14 @@ jobs:
       - name: Collect diagnostic results or send daily Slack digest once
         run: |
           target_date="${DIGEST_DATE:-$(TZ=America/Chicago date +%F)}"
+          if [ "${CORRECTION}" = "true" ]; then
+            if [ "${DRY_RUN}" = "true" ] || [ -z "${DIGEST_DATE}" ]; then
+              echo "Correction requires explicit digest_date and dry_run=false." >&2
+              exit 1
+            fi
+            python campusgroups_food_digest.py --date "${DIGEST_DATE}" --send-slack --github-delivery-guard --correction
+            exit 0
+          fi
           if [ "${DRY_RUN}" = "true" ]; then
             python campusgroups_food_digest.py --date "${target_date}" --dry-run
           else
