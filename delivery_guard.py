@@ -66,3 +66,10 @@ class DeliveryGuard:
     def confirm(self, day: date):
         self.request("/refs", {"ref": "refs/" + self.ref(day, "delivered"),
                                "sha": self.commit})
+
+
+class CorrectionGuard(DeliveryGuard):
+    """One correction per date, separate from the immutable original receipt."""
+    @staticmethod
+    def ref(day: date, state: str) -> str:
+        return f"tags/food-digest/{day.isoformat()}/correction-v1/{state}"
