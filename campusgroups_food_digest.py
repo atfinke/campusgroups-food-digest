@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any, Literal, Sequence
 from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, urlencode, urljoin, urlparse
-from urllib.request import HTTPSHandler, ProxyHandler, Request, build_opener
+from urllib.request import HTTPRedirectHandler, HTTPSHandler, ProxyHandler, Request, build_opener
 from zoneinfo import ZoneInfo
 
 from delivery_guard import DeliveryGuard, CorrectionGuard
@@ -249,6 +249,7 @@ class DigestResult(BaseModel):
     matching_event_count: int
     food_events: list[FoodEvent]
     matching_events: list[PublicEvent] = Field(default_factory=list)
+    unverified_events: list[PublicEvent] = Field(default_factory=list)
 
 
 class ScriptResult(BaseModel):
@@ -656,9 +657,27 @@ def build_opener_with_defaults():
     )
 
 
+class ExternalEventRedirect(RuntimeError):
+    pass
+
+
+def require_campusgroups_url(url: str) -> None:
+    parsed = urlparse(url)
+    if parsed.scheme != "https" or parsed.hostname != AUTHENTICATED_HOST or parsed.port not in (None, 443):
+        raise ExternalEventRedirect("External event destination blocked")
+
+
+class EventRedirectHandler(HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        require_campusgroups_url(newurl)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
 def fetch_text(url: str, headers: dict[str, str], timeout: int) -> str:
+    require_campusgroups_url(url)
     request = Request(url, headers=headers)
     opener = build_opener_with_defaults()
+    opener.add_handler(EventRedirectHandler())
     for attempt in range(1, DEFAULT_REQUEST_RETRIES + 1):
         LOGGER.info(
             "Starting HTTP request",
@@ -1059,16 +1078,29 @@ def fetch_rendered_event_detail(event_url: str, config: RuntimeConfig) -> EventD
 
 
 def fetch_rendered_event_detail_once(event_url: str, config: RuntimeConfig) -> EventDetail:
+    require_campusgroups_url(event_url)
     # Browser contexts retain the full authenticated cookie/local-storage state.
     # Bound browser launches independently from concurrent HTTP list requests.
     with RENDER_SLOTS, sync_playwright() as playwright:
         browser = playwright.chromium.launch(headless=True)
+        external_navigation = []
         try:
             context = browser.new_context(
                 storage_state=config.browser_storage_state,
                 timezone_id="America/Chicago",
             )
             page = context.new_page()
+            def block_external_navigation(route):
+                request = route.request
+                if request.is_navigation_request() and request.frame == page.main_frame:
+                    try:
+                        require_campusgroups_url(request.url)
+                    except ExternalEventRedirect:
+                        external_navigation.append(True)
+                        route.abort()
+                        return
+                route.continue_()
+            page.route("**/*", block_external_navigation)
             page.goto(event_url, wait_until="domcontentloaded", timeout=30_000)
             page.locator("h1").wait_for(timeout=30_000)
             page.wait_for_function(
@@ -1096,6 +1128,10 @@ def fetch_rendered_event_detail_once(event_url: str, config: RuntimeConfig) -> E
                 "has_title": bool(fields.get("title")),
             })
             return parse_rendered_event_fields(fields)
+        except PlaywrightError:
+            if external_navigation:
+                raise ExternalEventRedirect("External event navigation blocked") from None
+            raise
         finally:
             browser.close()
 
@@ -1223,6 +1259,14 @@ def collect_food_events(
         },
     )
 
+    unverified_events: list[PublicEvent] = []
+    def collect_event(event):
+        try:
+            return build_food_event(event, config, target_date), None
+        except ExternalEventRedirect:
+            LOGGER.warning("External event left unverified; coverage incomplete", extra={"event_id": event.event_id})
+            return None, event
+
     if not matching_events:
         food_events: list[FoodEvent] = []
     else:
@@ -1237,14 +1281,9 @@ def collect_food_events(
             },
         )
         with ThreadPoolExecutor(max_workers=worker_count) as executor:
-            food_events = [
-                food_event
-                for food_event in executor.map(
-                    lambda event: build_food_event(event, config, target_date),
-                    matching_events,
-                )
-                if food_event is not None
-            ]
+            outcomes = list(executor.map(collect_event, matching_events))
+            food_events = [food for food, _ in outcomes if food is not None]
+            unverified_events = [event for _, event in outcomes if event is not None]
 
     digest_result = DigestResult(
         base_url=DEFAULT_BASE_URL,
@@ -1253,12 +1292,14 @@ def collect_food_events(
         matching_event_count=len(matching_events),
         food_events=food_events,
         matching_events=matching_events,
+        unverified_events=unverified_events,
     )
     LOGGER.info(
         "Finished collecting food events",
         extra={
             "target_date": target_date.isoformat(),
             "food_event_count": len(food_events),
+            "unverified_event_count": len(unverified_events),
             "matching_event_count": len(matching_events),
         },
     )
@@ -1440,7 +1481,7 @@ def build_section_gap() -> SlackRichTextSection:
     return SlackRichTextSection(elements=[slack_text_element("\n")])
 
 
-def build_slack_text(result: DigestResult | None, session_valid: bool) -> str:
+def build_slack_text_base(result: DigestResult | None, session_valid: bool) -> str:
     if result is None or not result.food_events:
         target = (
             result.target_date.isoformat() if result is not None else "unknown date"
@@ -1481,7 +1522,7 @@ def build_slack_text(result: DigestResult | None, session_valid: bool) -> str:
     return "\n\n".join([header, *sections])
 
 
-def build_slack_payload(
+def build_slack_payload_base(
     result: DigestResult | None, session_valid: bool
 ) -> SlackPayload:
     text = build_slack_text(result, session_valid=session_valid)
@@ -1528,7 +1569,7 @@ def build_slack_payload(
             SlackRichTextBlock(
                 elements=[
                     SlackRichTextSection(
-                        elements=[slack_text_element("No Lunch Events", bold=True)]
+                        elements=[slack_text_element("No verified lunch events" if result.unverified_events else "No Lunch Events", bold=True)]
                     )
                 ]
             ),
@@ -1572,6 +1613,32 @@ def build_slack_payload(
         blocks.extend([SlackDividerBlock(), warning_block])
 
     return SlackPayload(text=text, blocks=blocks)
+
+
+def coverage_warning(result: DigestResult | None) -> str:
+    if result is None or not result.unverified_events:
+        return ""
+    titles = "; ".join(truncate_title(event.title) for event in result.unverified_events)
+    return (f"Coverage incomplete: {len(result.unverified_events)} external event(s) unverified. "
+            f"Food availability was not checked for: {titles}")
+
+
+def build_slack_text(result: DigestResult | None, session_valid: bool) -> str:
+    text = build_slack_text_base(result, session_valid)
+    warning = coverage_warning(result)
+    if warning and not result.food_events:
+        text = f"No verified lunch events with food found for {result.target_date.isoformat()}."
+    return text + ("\n\n" + warning if warning else "")
+
+
+def build_slack_payload(result: DigestResult | None, session_valid: bool) -> SlackPayload:
+    payload = build_slack_payload_base(result, session_valid)
+    warning = coverage_warning(result)
+    if warning:
+        payload.blocks = list(payload.blocks or []) + [SlackRichTextBlock(elements=[
+            SlackRichTextSection(elements=[slack_text_element(warning)])
+        ])]
+    return payload
 
 
 def parse_args(argv: Sequence[str]) -> argparse.Namespace:
@@ -1719,4 +1786,5 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
 
