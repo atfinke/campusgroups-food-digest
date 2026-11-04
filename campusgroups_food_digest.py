@@ -556,6 +556,24 @@ def maybe_complete_login_step(page: Page, config: RuntimeConfig) -> LoginStepRes
     return LoginStepResult(action="no_visible_login_inputs")
 
 
+def follow_kellogg_login_choice(page: Page, attempts: int) -> bool:
+    """Handle only the observed CampusGroups login-choice page and known SSO link."""
+    current = urlparse(page.url)
+    if current.scheme != "https" or current.netloc != AUTHENTICATED_HOST or current.path.rstrip("/") != "/webapp/auth/login":
+        return False
+    # Never bypass an additional verification challenge, even on this route.
+    if any(keyword in page_text(page).casefold() for keyword in MFA_KEYWORDS):
+        raise RuntimeError("CampusGroups login requested additional verification; manual review required")
+    choice = page.locator(f'a[href="{DEFAULT_SSO_URL}"]')
+    if choice.count() != 1 or not choice.is_visible() or not choice.is_enabled():
+        return False
+    if attempts >= 2:
+        raise RuntimeError("CampusGroups returned to the login-choice page repeatedly; SSO redirect limit reached")
+    choice.click()
+    LOGGER.info("Selected Kellogg school login", extra={"attempt": attempts + 1})
+    return True
+
+
 def create_authenticated_runtime_config(config: RuntimeConfig) -> RuntimeConfig:
     if not (config.netid and config.password):
         raise RuntimeError("Missing Northwestern credentials.")
@@ -575,6 +593,7 @@ def create_authenticated_runtime_config(config: RuntimeConfig) -> RuntimeConfig:
         context = browser.new_context()
         page = context.new_page()
         page.set_default_timeout(DEFAULT_LOGIN_TIMEOUT_MILLISECONDS)
+        school_login_attempts = 0
 
         try:
             LOGGER.info(
@@ -625,6 +644,11 @@ def create_authenticated_runtime_config(config: RuntimeConfig) -> RuntimeConfig:
                         extra={"step": step_number, "current_url": page.url},
                     )
                     time.sleep(1.0)
+                    continue
+
+                if follow_kellogg_login_choice(page, school_login_attempts):
+                    school_login_attempts += 1
+                    page.wait_for_timeout(1_500)
                     continue
 
                 step_result = maybe_complete_login_step(page, config)
