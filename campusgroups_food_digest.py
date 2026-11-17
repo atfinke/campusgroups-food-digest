@@ -14,11 +14,12 @@ from dataclasses import dataclass
 from datetime import date, datetime
 from html import unescape
 from html.parser import HTMLParser
+from http.cookiejar import Cookie, CookieJar, DefaultCookiePolicy
 from pathlib import Path
 from typing import Any, Literal, Sequence
 from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, urlencode, urljoin, urlparse
-from urllib.request import HTTPRedirectHandler, HTTPSHandler, ProxyHandler, Request, build_opener
+from urllib.request import HTTPCookieProcessor, HTTPRedirectHandler, HTTPSHandler, ProxyHandler, Request, build_opener
 from zoneinfo import ZoneInfo
 
 from delivery_guard import DeliveryGuard, CorrectionGuard
@@ -38,6 +39,7 @@ DEFAULT_BASE_URL = "https://kellogg.campusgroups.com"
 DEFAULT_SSO_URL = "https://www.campusgroups.com/shibboleth/login?idp=kellogg"
 DEFAULT_EVENTS_PATH = "/mobile_ws/v17/mobile_events_list"
 DEFAULT_AUTH_CHECK_PATH = "/groups"
+MAX_SESSION_REDIRECTS = 5
 DEFAULT_EVENT_PATH_TEMPLATE = "/rsvp_boot?id={event_id}"
 DEFAULT_LIMIT = 500
 DEFAULT_MAX_WORKERS = 2
@@ -674,10 +676,11 @@ def create_authenticated_runtime_config(config: RuntimeConfig) -> RuntimeConfig:
     raise RuntimeError("CampusGroups login did not produce an authenticated session.")
 
 
-def build_opener_with_defaults():
+def build_opener_with_defaults(*handlers):
     return build_opener(
         ProxyHandler({}),
         HTTPSHandler(context=ssl.create_default_context()),
+        *handlers,
     )
 
 
@@ -700,8 +703,7 @@ class EventRedirectHandler(HTTPRedirectHandler):
 def fetch_text(url: str, headers: dict[str, str], timeout: int) -> str:
     require_campusgroups_url(url)
     request = Request(url, headers=headers)
-    opener = build_opener_with_defaults()
-    opener.add_handler(EventRedirectHandler())
+    opener = build_opener_with_defaults(EventRedirectHandler())
     for attempt in range(1, DEFAULT_REQUEST_RETRIES + 1):
         LOGGER.info(
             "Starting HTTP request",
@@ -790,10 +792,42 @@ def post_json(url: str, payload: dict[str, object], timeout: int) -> None:
     )
 
 
-def session_cookie_header(config: RuntimeConfig) -> str:
-    if config.session_id is None:
-        raise RuntimeError("RuntimeConfig is missing session_id.")
-    return f"CG.SessionID={config.session_id}"
+def session_cookie_jar(config: RuntimeConfig) -> CookieJar:
+    """Transfer browser cookies without dropping scope, expiry, or auth companions."""
+    jar = CookieJar(policy=DefaultCookiePolicy(
+        strict_ns_domain=DefaultCookiePolicy.DomainStrictNonDomain,
+    ))
+    if config.browser_storage_state is not None:
+        cookies = config.browser_storage_state.get("cookies", [])
+    elif config.session_id:
+        cookies = [{"name": "CG.SessionID", "value": config.session_id,
+                    "domain": AUTHENTICATED_HOST, "path": "/", "secure": True}]
+    else:
+        raise RuntimeError("RuntimeConfig is missing authenticated session cookies.")
+    for item in cookies:
+        domain = item["domain"]
+        # Do not import identity-provider or unrelated-origin cookies.
+        if domain.lstrip(".") not in (AUTHENTICATED_HOST, "campusgroups.com"):
+            continue
+        expires = item.get("expires", -1)
+        expires = int(expires) if expires > 0 else None
+        jar.set_cookie(Cookie(
+            version=0, name=item["name"], value=item["value"],
+            port=None, port_specified=False,
+            domain=domain, domain_specified=domain.startswith("."),
+            domain_initial_dot=domain.startswith("."),
+            path=item.get("path", "/"), path_specified=True,
+            secure=item.get("secure", False), expires=expires,
+            discard=expires is None, comment=None, comment_url=None,
+            rest={}, rfc2109=False,
+        ))
+    return jar
+
+
+def session_cookie_header(config: RuntimeConfig, url: str = DEFAULT_BASE_URL) -> str:
+    request = Request(url)
+    session_cookie_jar(config).add_cookie_header(request)
+    return request.get_header("Cookie") or ""
 
 
 def auth_check_url(config: RuntimeConfig) -> str:
@@ -827,7 +861,7 @@ def fetch_list_payload(config: RuntimeConfig, limit: int) -> str:
         "Referer": f"{DEFAULT_BASE_URL.rstrip('/')}/events",
         "User-Agent": USER_AGENT,
         "X-Requested-With": "XMLHttpRequest",
-        "Cookie": session_cookie_header(config),
+        "Cookie": session_cookie_header(config, list_endpoint(config, limit)),
     }
     return fetch_text(
         list_endpoint(config, limit),
@@ -1165,7 +1199,7 @@ def fetch_event_detail(event_url: str, config: RuntimeConfig) -> EventDetail:
     headers = {
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "User-Agent": USER_AGENT,
-        "Cookie": session_cookie_header(config),
+        "Cookie": session_cookie_header(config, event_url),
     }
     html_text = fetch_text(
         event_url, headers=headers, timeout=DEFAULT_REQUEST_TIMEOUT_SECONDS
@@ -1330,24 +1364,61 @@ def collect_food_events(
     return digest_result
 
 
+class SessionValidationError(RuntimeError):
+    """A safe-to-log authentication failure without raw redirect URLs or cookies."""
+
+
+class SessionRedirectHandler(HTTPRedirectHandler):
+    def __init__(self):
+        self.redirect_count = 0
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        self.redirect_count += 1
+        parsed = urlparse(newurl)
+        try:
+            require_campusgroups_url(newurl)
+            if parsed.username is not None or parsed.password is not None:
+                raise ExternalEventRedirect("URL credentials are not allowed")
+        except (ExternalEventRedirect, ValueError):
+            raise SessionValidationError("Session validation blocked an unsafe redirect") from None
+        LOGGER.info("Session validation redirect", extra={
+            "redirect_count": self.redirect_count, "status_code": code,
+            "destination_host": parsed.hostname,
+        })
+        if self.redirect_count > MAX_SESSION_REDIRECTS:
+            raise SessionValidationError("Session validation redirect limit exceeded")
+        if parsed.path.rstrip("/").casefold().startswith("/webapp/auth/login"):
+            raise SessionValidationError("Session validation redirected to login; authentication not verified")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
 def validate_session(config: RuntimeConfig) -> bool:
-    LOGGER.info(
-        "Validating authenticated CampusGroups session",
-        extra={"auth_check_url": auth_check_url(config)},
-    )
+    LOGGER.info("Validating authenticated CampusGroups session")
     headers = {
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "User-Agent": USER_AGENT,
-        "Cookie": session_cookie_header(config),
     }
     request = Request(auth_check_url(config), headers=headers)
-    opener = build_opener_with_defaults()
-    with opener.open(request, timeout=DEFAULT_REQUEST_TIMEOUT_SECONDS) as response:
-        final_url = response.geturl()
-    session_valid = "/webapp/auth/login" not in final_url
+    # Pass the handler at construction so it replaces urllib's default redirect
+    # handler instead of competing with it at the same handler_order.
+    opener = build_opener_with_defaults(
+        SessionRedirectHandler(), HTTPCookieProcessor(session_cookie_jar(config)),
+    )
+    try:
+        with opener.open(request, timeout=DEFAULT_REQUEST_TIMEOUT_SECONDS) as response:
+            final_url = response.geturl()
+            require_campusgroups_url(final_url)
+            session_valid = (200 <= response.status < 300
+                             and not urlparse(final_url).path.rstrip("/").casefold().startswith("/webapp/auth/login"))
+    except (HTTPError, URLError, ExternalEventRedirect, ValueError) as exc:
+        LOGGER.warning("Session validation request failed", extra={
+            "error_type": type(exc).__name__,
+            "status_code": exc.code if isinstance(exc, HTTPError) else None,
+        })
+        raise SessionValidationError("CampusGroups session validation failed; no digest was sent") from None
     LOGGER.info(
         "Validated authenticated CampusGroups session",
-        extra={"session_valid": session_valid, "final_url": final_url},
+        extra={"session_valid": session_valid},
     )
     return session_valid
 
@@ -1708,6 +1779,8 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
 def run(config: RuntimeConfig, target_date: date) -> ScriptResult:
     LOGGER.info("Running digest", extra={"target_date": target_date.isoformat()})
     session_valid = validate_session(config)
+    if not session_valid:
+        raise SessionValidationError("CampusGroups session was not verified; collection and delivery stopped")
     digest_result = collect_food_events(
         config=config,
         target_date=target_date,
@@ -1810,5 +1883,6 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
 
 
